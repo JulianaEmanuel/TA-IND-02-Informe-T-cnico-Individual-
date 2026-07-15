@@ -1,0 +1,315 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.5cm, headheight=14pt]{geometry}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds}
+\usepackage{caption}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{setspace}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+
+\titleformat{\section}{\normalfont\Large\bfseries}{\thesection.}{0.6em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries}{\thesubsection}{0.6em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{TA-IND-02 -- Consistencia y Replicaci\'on en BDD}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\setstretch{1.08}
+
+\begin{document}
+
+% ============================================================
+% PORTADA
+% ============================================================
+\begin{titlepage}
+\centering
+\vspace*{1.5cm}
+{\large UNIVERSIDAD T\'ECNICA ESTATAL DE QUEVEDO\par}
+{\large Facultad de Ciencias de la Computaci\'on\par}
+{\large Carrera de Ingenier\'ia de Software\par}
+\vspace{0.3cm}
+{\normalsize Aplicaciones Distribuidas (ISR-701) --- Unidad 3: Bases de Datos Distribuidas\par}
+\vspace{2.5cm}
+
+{\Huge\bfseries Informe T\'ecnico Individual\par}
+\vspace{0.5cm}
+{\Large An\'alisis de Consistencia y Replicaci\'on en Bases de Datos Distribuidas\par}
+\vspace{0.4cm}
+{\large Caso de estudio: Microservicio \texttt{sga-soporte} --- M\'odulo de Gesti\'on de Tickets\par}
+
+\vspace{2cm}
+\begin{tabular}{rl}
+\textbf{C\'odigo:} & TA-IND-02 \\[4pt]
+\textbf{Estudiante:} & Juliana Romina Emanuel Pino \\[4pt]
+\textbf{Equipo PFC:} & ACC -- Soporte T\'ecnico ISP (Gesti\'on de Tickets) \\[4pt]
+\textbf{Asignatura:} & Aplicaciones Distribuidas (ISR-701) \\[4pt]
+\textbf{Unidad:} & 3 -- Bases de Datos Distribuidas \\[4pt]
+\textbf{Docente:} & Prof. Guerrero Ulloa G.C. \\[4pt]
+\textbf{Fecha:} & 14 de julio de 2026 \\
+\end{tabular}
+
+\vfill
+{\normalsize Periodo 2026--2027\par}
+\end{titlepage}
+
+% ============================================================
+% RESUMEN
+% ============================================================
+\section*{Resumen}
+Este informe analiza el modelo de consistencia y la estrategia de replicaci\'on realmente implementados en el subsistema de soporte t\'ecnico (\texttt{sga-soporte}) del equipo ACC, que expone la gesti\'on de tickets del Sistema de Gesti\'on Acad\'emica de la UTEQ. El sistema no replica datos entre nodos propios: dos microservicios independientes (\texttt{sga-soporte} y \texttt{sga-principal}) comparten una \'unica instancia primaria de PostgreSQL alojada en Supabase, diferenciada por esquemas. Se caracteriza este dise\~no como un modelo de \emph{consistencia fuerte por concentraci\'on en un solo nodo autoritativo}, se contrasta con los marcos CAP y PACELC, y se eval\'uan dos alternativas --- r\'eplicas de lectura as\'incronas (patr\'on l\'ider--seguidor) y base de datos por servicio con propagaci\'on por eventos --- mediante una tabla comparativa de cuatro criterios t\'ecnicos. La discusi\'on cr\'itica concluye que el modelo actual es adecuado para el volumen y la criticidad actuales del dominio de tickets, pero que compromete la disponibilidad y la evoluci\'on independiente de los servicios, por lo que se proponen mitigaciones concretas sin abandonar PostgreSQL como motor principal.
+
+\vspace{0.4cm}
+\noindent\textit{Palabras clave: consistencia, replicaci\'on, CAP, PACELC, microservicios, PostgreSQL, base de datos compartida.}
+
+\clearpage
+
+\tableofcontents
+\clearpage
+
+% ============================================================
+% 1. INTRODUCCION
+% ============================================================
+\section{Introducci\'on}
+
+El Sistema de Gesti\'on Acad\'emica (SGA) de la Universidad T\'ecnica Estatal de Quevedo se construye como un conjunto de microservicios independientes que colaboran mediante autenticaci\'on JWT compartida. Dentro de este ecosistema, el equipo ACC es responsable del subsistema de \textbf{Soporte T\'ecnico}, materializado en el microservicio \texttt{sga-soporte} (puerto 8081, backend Spring Boot, frontend React/Vite/Tailwind en el puerto 5173) y su contraparte \texttt{sga-principal} (puerto 8080), que gestiona usuarios y emite los tokens de autenticaci\'on que \texttt{sga-soporte} valida localmente.
+
+El dominio funcional de \texttt{sga-soporte} es la gesti\'on de tickets de incidencias: creaci\'on, asignaci\'on, cambio de estado (\texttt{ABIERTO}, \texttt{EN\_PROCESO}, \texttt{RESUELTO}, \texttt{CERRADO}), comentarios asociados --- incluyendo notas internas no visibles para el usuario final --- y estad\'isticas agregadas por estado. Se trata de un dominio con requisitos de integridad moderados: un ticket debe tener en todo momento un estado \'unico y consistente, visible de forma id\'entica para el usuario que lo cre\'o, el t\'ecnico asignado y cualquier panel de auditor\'ia, pero no exige la latencia de submilisegundo ni el volumen transaccional de un sistema financiero o de reservas de alta concurrencia.
+
+Este informe responde a la pregunta orientadora del TA-IND-02: \emph{\textbf{\textquotedblleft es el modelo de consistencia elegido el \'optimo para el dominio del sistema?\textquotedblright}} Para ello, la Secci\'on~2 revisa el marco te\'orico de modelos de consistencia, los teoremas CAP y PACELC, y las estrategias de replicaci\'on. La Secci\'on~3 caracteriza el modelo realmente implementado en \texttt{sga-soporte}, a partir de la inspecci\'on directa del c\'odigo fuente (capas \texttt{entity}, \texttt{repository}, \texttt{service} y \texttt{application.properties}). La Secci\'on~4 eval\'ua dos alternativas de consistencia/replicaci\'on frente al modelo actual. La Secci\'on~5 discute cr\'iticamente si el modelo elegido es \'optimo, y la Secci\'on~6 concluye con recomendaciones concretas.
+
+% ============================================================
+% 2. MARCO TEORICO
+% ============================================================
+\section{Marco te\'orico}
+
+\subsection{Modelos de consistencia}
+
+La consistencia en un almac\'en de datos distribuido no es una propiedad binaria (\textquotedblleft consistente\textquotedblright\ o \textquotedblleft inconsistente\textquotedblright), sino un espectro ordenado de garant\'ias con sem\'antica formal precisa \cite{viotti2016}. En orden decreciente de fuerza:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Consistencia fuerte / linealizabilidad}: toda operaci\'on de lectura observa el efecto de la \'ultima escritura confirmada, como si existiera una \'unica copia de los datos y un orden global total de operaciones \cite{viotti2016}. Es la garant\'ia m\'as costosa de sostener porque exige coordinaci\'on entre r\'eplicas antes de confirmar cada escritura.
+  \item \textbf{Consistencia secuencial}: todas las r\'eplicas observan las operaciones en el mismo orden, pero ese orden no tiene por qu\'e coincidir con el orden real en el tiempo \cite{viotti2016}.
+  \item \textbf{Consistencia causal}: solo se garantiza el orden entre operaciones causalmente relacionadas; operaciones concurrentes pueden observarse en \'ordenes distintos en distintos nodos \cite{viotti2016}.
+  \item \textbf{Lectura de los propios cambios (read-your-writes)}: un cliente siempre ve sus propias escrituras previas, aunque no necesariamente las de otros clientes de forma inmediata \cite{viotti2016}.
+  \item \textbf{Consistencia eventual}: en ausencia de nuevas escrituras, todas las r\'eplicas convergen finalmente al mismo estado, sin garant\'ia de cu\'ando ocurre esa convergencia \cite{viotti2016}.
+\end{itemize}
+
+Cuanto m\'as fuerte es el modelo, mayor es la coordinaci\'on (y por tanto la latencia y el acoplamiento entre nodos) necesaria para sostenerlo; cuanto m\'as d\'ebil, mayor es la disponibilidad y menor la latencia percibida, al costo de exponer estados transitoriamente divergentes entre r\'eplicas \cite{viotti2016}.
+
+\subsection{Teoremas de compromiso: CAP y PACELC}
+
+El teorema CAP, formalizado por Gilbert y Lynch a partir de la conjetura de Brewer, establece que ante una partici\'on de red un sistema distribuido no puede garantizar simult\'aneamente consistencia (\emph{Consistency}) y disponibilidad (\emph{Availability}); debe sacrificar una de las dos mientras la partici\'on persiste, conservando siempre tolerancia a particiones (\emph{Partition tolerance}) \cite{gilbert2002}.
+
+CAP, sin embargo, solo describe el comportamiento del sistema \emph{durante} una partici\'on, que es un evento relativamente infrecuente. Abadi extiende el an\'alisis con la formulaci\'on PACELC: si hay Partici\'on (P), el sistema elige entre Availability (A) y Consistency (C), \emph{pero adem\'as (Else)}, en operaci\'on normal sin particiones, todo sistema replicado enfrenta un segundo compromiso entre Latencia (L) y Consistencia (C) \cite{abadi2012}. Un sistema que replica de forma s\'incrona para garantizar consistencia fuerte paga esa consistencia con latencia adicional en cada escritura, incluso cuando la red funciona con normalidad; un sistema que replica de forma as\'incrona reduce la latencia percibida pero admite una ventana de posible p\'erdida o desactualizaci\'on de datos. PACELC es el marco m\'as adecuado para analizar sistemas que, como el del presente informe, no operan sobre m\'ultiples nodos de datos propios y por tanto rara vez enfrentan particiones internas, pero s\'i toman decisiones cotidianas de dise\~no que afectan el eje latencia--consistencia.
+
+\subsection{Estrategias de replicaci\'on}
+
+Sabaghian, Khamforoosh y Ghaderzadeh, en su revisi\'on del estado del arte sobre replicaci\'on y ubicaci\'on de datos en sistemas distribuidos, caracterizan las estrategias de replicaci\'on seg\'un d\'onde reside la autoridad de escritura y c\'omo se propaga el cambio \cite{sabaghian2023}:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Primario--respaldo (l\'ider--seguidor)}: un \'unico nodo l\'ider acepta escrituras y las propaga a nodos seguidores de solo lectura; simplifica la resoluci\'on de conflictos porque nunca hay dos escritores concurrentes sobre el mismo dato \cite{sabaghian2023}.
+  \item \textbf{Multi-l\'ider}: varios nodos aceptan escrituras de forma independiente y sincronizan cambios entre s\'i, lo que exige mecanismos de resoluci\'on de conflictos (por ejemplo, resoluci\'on por marca temporal o CRDTs) \cite{sabaghian2023}.
+  \item \textbf{Sin l\'ider por quorum}: cualquier r\'eplica acepta lecturas y escrituras, y la consistencia se negocia por solapamiento de quorum ($W + R > N$) en cada operaci\'on, como en Dynamo \cite{decandia2007}.
+  \item \textbf{Replicaci\'on s\'incrona frente a as\'incrona}: la replicaci\'on s\'incrona confirma la escritura solo tras propagarla a las r\'eplicas requeridas (mayor consistencia, mayor latencia); la as\'incrona confirma de inmediato en el nodo local y propaga en segundo plano (menor latencia, ventana de inconsistencia) \cite{sabaghian2023}.
+\end{itemize}
+
+Los sistemas de referencia industrial ilustran los extremos de este espectro. Dynamo, el almac\'en clave--valor de Amazon, prioriza la disponibilidad mediante replicaci\'on sin l\'ider por quorum y consistencia eventual, aceptando que distintas r\'eplicas puedan divergir temporalmente a cambio de nunca rechazar una escritura \cite{decandia2007}. En el extremo opuesto, Spanner, de Google, ofrece consistencia externa --- transacciones globalmente consistentes incluso a trav\'es de centros de datos distantes --- apoy\'andose en sincronizaci\'on temporal de alta precisi\'on (TrueTime) para ordenar transacciones sin necesidad de comunicaci\'on adicional entre r\'eplicas \cite{corbett2013}. Estos dos casos definen los polos frente a los cuales se punt\'ua, en la Secci\'on~4, el modelo del sistema propio.
+
+Cabe se\~nalar que la coordinaci\'on de datos entre microservicios no se limita a la replicaci\'on cl\'asica entre nodos de una misma base de datos. El estudio emp\'irico de Laigner \emph{et al.}, basado en la revisi\'on de aplicaciones de microservicios de c\'odigo abierto y una encuesta a m\'as de 120 profesionales, clasifica la persistencia de microservicios en tres patrones: tablas privadas que comparten servidor y esquema de base de datos, esquema por microservicio sobre un servidor com\'un, y servidor de base de datos independiente por microservicio; y encuentra que la mayor\'ia de los profesionales prefiere encapsular el estado de cada microservicio en su propio servidor, precisamente para lograr acoplamiento d\'ebil, aislamiento de fallos y evoluci\'on independiente del esquema \cite{laigner2021}. La gesti\'on de la consistencia de datos entre servicios sigue siendo, de hecho, uno de los retos de dise\~no m\'as se\~nalados en la literatura reciente sobre arquitecturas de microservicios \cite{narvaez2025}.
+
+% ============================================================
+% 3. ANALISIS DEL MODELO DEL PFC
+% ============================================================
+\section{An\'alisis del modelo de consistencia del PFC}
+
+\subsection{Caracterizaci\'on del modelo implementado}
+\label{sec:caracterizacion}
+
+La inspecci\'on del c\'odigo fuente de \texttt{sga-soporte} permite caracterizar el modelo de datos con precisi\'on, sin necesidad de inferencias. El archivo \texttt{application.properties} declara una \'unica fuente de datos:
+
+\begin{quote}\ttfamily\footnotesize
+spring.datasource.url=jdbc:postgresql://aws-1-us-east-1.\allowbreak pooler.supabase.com:5432/postgres\\
+spring.jpa.properties.hibernate.default\_schema=sga\_principal\\
+spring.datasource.hikari.maximum-pool-size=2
+\end{quote}
+
+Es decir: \texttt{sga-soporte} no posee una base de datos propia. Se conecta, a trav\'es de un \emph{pooler} de conexiones, a la \textbf{misma instancia f\'isica de PostgreSQL gestionada por Supabase} que utiliza \texttt{sga-principal}, diferenci\'andose \'unicamente por esquema: las entidades \texttt{TicketSoporte} y \texttt{ComentarioTicket} se mapean expl\'icitamente al esquema \texttt{soporte} (\texttt{@Table(schema = "soporte")}), mientras que el esquema por defecto de Hibernate para el resto de operaciones es \texttt{sga\_principal}, el esquema propio del microservicio de usuarios. No existe bus de mensajes, cola de eventos ni mecanismo de sincronizaci\'on entre nodos de datos: la \'unica autoridad de escritura es el propio motor de PostgreSQL de Supabase.
+
+Esto tiene una consecuencia conceptual importante para el informe: \textbf{no hay, en sentido estricto, replicaci\'on de datos dise\~nada por el equipo}. Lo que existe es un \emph{modelo de nodo \'unico compartido entre servicios}, apoyado en las garant\'ias ACID nativas de un motor relacional. La Figura~\ref{fig:topologia} ilustra esta topolog\'ia.
+
+\begin{figure}[h!]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners, minimum width=3.1cm, minimum height=1.1cm, align=center, font=\small},
+  db/.style={draw, cylinder, shape border rotate=90, aspect=0.25, minimum height=1.6cm, minimum width=2.6cm, align=center, font=\small},
+  arr/.style={-{Latex[length=2.2mm]}, thick}
+]
+  \node[box, fill=blue!8] (front) {Frontend React/Vite\\(localhost:5173)};
+  \node[box, fill=orange!12, below left=1.4cm and 0.4cm of front] (soporte) {sga-soporte\\Spring Boot (8081)};
+  \node[box, fill=orange!12, below right=1.4cm and 0.4cm of front] (principal) {sga-principal\\Spring Boot (8080)};
+  \node[db, fill=green!10, below=2.4cm of front] (pg) {PostgreSQL\\(Supabase, nodo \'unico)\\esquemas: \texttt{soporte},\\ \texttt{sga\_principal}};
+
+  \draw[arr] (front) -- (soporte) node[midway, above left, font=\scriptsize] {REST + JWT};
+  \draw[arr] (front) -- (principal) node[midway, above right, font=\scriptsize] {REST + JWT};
+  \draw[arr] (soporte) -- (pg) node[midway, left, font=\scriptsize] {JDBC (pool=2)};
+  \draw[arr] (principal) -- (pg) node[midway, right, font=\scriptsize] {JDBC};
+  \draw[{Latex[length=2.2mm]}-{Latex[length=2.2mm]}, thick, dashed] (soporte) -- (principal) node[midway, below, font=\scriptsize] {valida JWT (sin llamada de red)};
+\end{tikzpicture}
+\caption{Topolog\'ia de datos de \texttt{sga-soporte}: dos microservicios independientes comparten una \'unica instancia primaria de PostgreSQL, diferenciados por esquema. No existe replicaci\'on de datos propia del equipo; la consistencia entre servicios depende enteramente del nodo relacional compartido.}
+\label{fig:topologia}
+\end{figure}
+
+Como se observa en la Figura~\ref{fig:topologia}, la \'unica forma de acoplamiento entre \texttt{sga-soporte} y \texttt{sga-principal} a nivel de datos es indirecta: ambos escriben en la misma instancia, pero no existe una tabla o entidad compartida a nivel de dominio de tickets (los usuarios se resuelven por \texttt{username}, un identificador de texto embebido en el JWT y en los campos \texttt{creadoPor}/\texttt{asignadoA}, no por clave for\'anea de base de datos). El acoplamiento de autenticaci\'on es a nivel de aplicaci\'on (\texttt{jwt.secret} id\'entico en ambos servicios), no de base de datos.
+
+A nivel de operaciones, la capa \texttt{TicketService} usa \texttt{@Transactional} de Spring en cada m\'etodo de escritura (\texttt{crear}, \texttt{actualizar}, \texttt{cambiarEstado}) y \texttt{@Transactional(readOnly = true)} en las de lectura. Al no existir m\'as que un nodo de datos, cada transacci\'on se resuelve con las garant\'ias ACID por defecto de PostgreSQL (nivel de aislamiento \emph{read committed} salvo configuraci\'on expl\'icita), sin necesidad de protocolos de confirmaci\'on distribuida (2PC, sagas, etc.). El tama\~no de pool de conexiones, limitado a dos (\texttt{maximum-pool-size=2}), es una restricci\'on de la capa gratuita de Supabase y no una decisi\'on de consistencia, pero condiciona directamente la disponibilidad percibida bajo concurrencia, como se discute en la Secci\'on~5.
+
+\subsection{Justificaci\'on t\'ecnica ligada al dominio}
+
+Le\'ido bajo CAP, el sistema no enfrenta el dilema cl\'asico de forma directa: al no tener r\'eplicas propias de datos, no existe partici\'on \emph{interna} que obligue a elegir entre consistencia y disponibilidad del lado del equipo ACC. La partici\'on relevante en este dise\~no es externa: la conectividad entre los microservicios (desplegados, por ejemplo, en distintos contenedores o m\'aquinas) y la instancia de Supabase, que corre en la infraestructura de un proveedor gestionado. Si esa conectividad falla, \texttt{sga-soporte} pierde disponibilidad por completo (no puede leer ni escribir), en vez de degradar a un modo de disponibilidad parcial con datos potencialmente obsoletos. Es, en la terminolog\'ia de CAP, un sistema que \textbf{renuncia a la disponibilidad ante una partici\'on, en favor de la consistencia}, aunque esa renuncia no es una decisi\'on de dise\~no expl\'icita del equipo, sino una consecuencia de no tener r\'eplicas a las que degradar.
+
+Le\'ido bajo PACELC, el eje relevante es el segundo (\emph{else}: latencia contra consistencia en operaci\'on normal). Como no hay replicaci\'on, no existe el compromiso latencia--consistencia que aparece en sistemas con m\'ultiples r\'eplicas: cada lectura obtiene autom\'aticamente el dato m\'as reciente, porque solo hay un lugar donde el dato puede estar. El costo de esta simplicidad se paga en otro eje, no capturado directamente por PACELC pero s\'i relevante para el dominio: la \textbf{latencia de red hacia un \'unico proveedor externo} (Supabase, alojado en \texttt{us-east-1}) y el \textbf{l\'imite de concurrencia} impuesto por el pool de dos conexiones, que puede convertirse en un cuello de botella si varios t\'ecnicos consultan o actualizan tickets simult\'aneamente.
+
+Para el dominio de gesti\'on de tickets de soporte t\'ecnico, esta elecci\'on es razonable en varios sentidos:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item El volumen de escrituras es bajo (creaci\'on y actualizaci\'on de tickets por un n\'umero acotado de t\'ecnicos y usuarios de una instituci\'on universitaria), por lo que la ausencia de r\'eplicas de escritura no representa hoy un cuello de botella cr\'itico.
+  \item La integridad del estado de un ticket es m\'as valiosa que la disponibilidad extrema: que dos t\'ecnicos vean el mismo ticket como \texttt{ABIERTO} cuando en realidad ya fue \texttt{RESUELTO} podr\'ia derivar en trabajo duplicado o en informaci\'on contradictoria para el usuario que reporta el problema. El modelo de nodo \'unico, al no admitir estados divergentes entre r\'eplicas, elimina por construcci\'on esa clase de error.
+  \item El acoplamiento de autenticaci\'on por JWT sim\'etrico evita que la validaci\'on de identidad dependa de una llamada de red a \texttt{sga-principal} en cada petici\'on, lo que s\'i habr\'ia introducido una dependencia expl\'icita de disponibilidad entre servicios.
+\end{enumerate}
+
+No obstante, esta misma elecci\'on genera los riesgos que se punt\'ualizan en la Secci\'on~5: dependencia total de un proveedor externo, imposibilidad de escalar lecturas horizontalmente, y un acoplamiento de esquema entre dos microservicios que, arquitect\'onicamente, deber\'ian evolucionar de forma independiente.
+
+% ============================================================
+% 4. EVALUACION DE ALTERNATIVAS
+% ============================================================
+\section{Evaluaci\'on de alternativas}
+
+Se contrastan a continuaci\'on dos alternativas de consistencia/replicaci\'on frente al modelo actual (nodo \'unico compartido), seleccionadas por representar los dos caminos de evoluci\'on m\'as plausibles para este sistema: una que mantiene PostgreSQL pero introduce replicaci\'on, y otra que separa la base de datos por servicio.
+
+\subsection{Alternativa A: r\'eplicas de lectura as\'incronas (l\'ider--seguidor)}
+Consiste en mantener PostgreSQL como l\'ider \'unico de escritura, pero a\~nadir una o m\'as r\'eplicas de solo lectura (\emph{read replicas}) mediante replicaci\'on de flujo (\emph{streaming replication}) nativa de PostgreSQL, redirigiendo hacia ellas las consultas de solo lectura de \texttt{TicketService} (\texttt{listarTodos}, \texttt{buscar}, \texttt{estadisticas}) \cite{sabaghian2023}. El l\'ider sigue siendo el \'unico punto de escritura, por lo que la consistencia de las escrituras no cambia; lo que cambia es que las lecturas pueden observar un estado ligeramente rezagado (consistencia de lectura de los propios cambios no garantizada por defecto, salvo que se fuerce la lectura al l\'ider tras una escritura reciente).
+
+\subsection{Alternativa B: base de datos por servicio con propagaci\'on por eventos}
+Consiste en dotar a \texttt{sga-soporte} de su propio esquema f\'isicamente independiente (o incluso de un motor distinto), eliminando la dependencia directa sobre el esquema \texttt{sga\_principal}, y sincronizar los datos de usuario necesarios (por ejemplo, nombre visible del t\'ecnico asignado) mediante eventos as\'incronos publicados por \texttt{sga-principal} \cite{laigner2021}. Este es el patr\'on \emph{database-per-service}, que exige aceptar consistencia eventual entre servicios a cambio de desacoplarlos por completo.
+
+\begin{table}[h!]
+\centering
+\small
+\caption{Comparaci\'on del modelo actual frente a dos alternativas, seg\'un cuatro criterios t\'ecnicos.}
+\label{tab:comparacion}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+\textbf{Criterio} & \textbf{Actual: nodo \'unico} & \textbf{Alt. A: r\'eplicas lectura} & \textbf{Alt. B: BD por servicio} \\
+\midrule
+Consistencia & Fuerte (autom\'atica) & Fuerte en escritura; & Eventual entre servicios \\
+ & & eventual en lectura & (propagaci\'on por eventos) \\
+\addlinespace
+Disponibilidad & Baja ante ca\'ida del & Media: lecturas resisten & Alta: cada servicio opera \\
+ & \'unico nodo & ca\'ida del l\'ider & aunque el otro falle \\
+\addlinespace
+Latencia & Baja en escritura; & Baja en lectura (nodo & Baja en ambos, salvo \\
+ & sujeta a pool de 2 & cercano); sin cambio en & retraso de sincronizaci\'on \\
+ & conexiones & escritura & de eventos \\
+\addlinespace
+Tolerancia a & Nula (un solo punto & Parcial (l\'ider sigue & Alta (fallos aislados \\
+particiones & de fallo) & siendo punto \'unico) & por servicio) \\
+\addlinespace
+Complejidad de & M\'inima (sin cambios & Media (configurar & Alta (esquema propio, \\
+implementaci\'on & de infraestructura) & r\'eplicas, enrutar queries) & bus de eventos, DTOs) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Como resume la Tabla~\ref{tab:comparacion}, ambas alternativas mejoran la disponibilidad y, en el caso de la Alternativa~B, la tolerancia a particiones y la autonom\'ia de despliegue, pero lo hacen a costa de introducir alguna forma de consistencia no estrictamente fuerte y de aumentar la complejidad operativa. Ninguna alternativa es estrictamente superior: la Alternativa~A es una mejora incremental de bajo riesgo; la Alternativa~B es un rediseño arquitect\'onico mayor, m\'as alineado con las buenas pr\'acticas de microservicios pero desproporcionado para el volumen de datos actual del m\'odulo de soporte.
+
+% ============================================================
+% 5. DISCUSION CRITICA
+% ============================================================
+\section{Discusi\'on cr\'itica}
+
+\'Es el modelo de consistencia elegido el \'optimo para el dominio del sistema? La respuesta de este informe es \textbf{matizada: es adecuado para el estado actual del proyecto, pero no es una elecci\'on de dise\~no deliberada y presenta limitaciones que conviene mitigar antes de escalar}.
+
+A favor del modelo actual: la consistencia fuerte autom\'atica que ofrece un \'unico nodo relacional es exactamente la garant\'ia que el dominio de tickets necesita (un ticket no puede estar simult\'aneamente \texttt{ABIERTO} y \texttt{RESUELTO} para observadores distintos), y se obtiene sin ning\'un c\'odigo adicional de coordinaci\'on, lo cual es razonable para un equipo estudiantil con recursos y tiempo limitados y un volumen de datos institucional, no masivo.
+
+En contra, y en l\'inea con lo que la literatura emp\'irica de arquitectura de microservicios describe como una desviaci\'on del patr\'on recomendado de base de datos por servicio \cite{laigner2021}: dos servicios que deber\'ian ser independientes (\texttt{sga-soporte} y \texttt{sga-principal}) comparten f\'isicamente la misma base de datos, diferenci\'andose solo por esquema. Esto crea tres riesgos concretos, ninguno de ellos hipot\'etico dado el c\'odigo revisado:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{Punto \'unico de fallo total}: si la instancia de Supabase se degrada o excede su cuota (la propia configuraci\'on documenta que se trata de un plan gratuito con pool limitado a dos conexiones), \emph{ambos} microservicios pierden disponibilidad simult\'aneamente, incluso si uno de ellos no tiene relaci\'on funcional con el problema que origin\'o la degradaci\'on.
+  \item \textbf{Acoplamiento de esquema oculto}: aunque no hay claves for\'aneas de base de datos entre \texttt{soporte} y \texttt{sga\_principal}, un cambio futuro en las convenciones de \texttt{username} del microservicio principal (por ejemplo, migrar de nombre de usuario a identificador num\'erico) romper\'ia silenciosamente los campos \texttt{creadoPor}/\texttt{asignadoA} de \texttt{sga-soporte}, sin que exista un contrato de API expl\'icito que lo prevenga.
+  \item \textbf{L\'imite de concurrencia artificial}: un pool de dos conexiones JDBC por microservicio, multiplicado por dos microservicios sobre la misma instancia, deja un margen muy estrecho antes de agotar las conexiones disponibles del plan gratuito de Supabase bajo uso concurrente real, lo que en la pr\'actica limita la disponibilidad mucho antes de que el volumen de datos lo justifique.
+\end{enumerate}
+
+Estas limitaciones no invalidan la elecci\'on actual para la fase de desarrollo en curso, pero s\'i marcan un techo claro de crecimiento. Como mitigaciones concretas, sin requerir el rediise\~no completo de la Alternativa~B, se recomienda: (i) elevar el plan de Supabase o migrar a una instancia dedicada antes de un despliegue en producci\'on real, ampliando el pool de conexiones; (ii) introducir al menos la Alternativa~A (r\'eplica de lectura) para las consultas de estad\'isticas y listados, que son las de mayor frecuencia y menor sensibilidad a una consistencia estrictamente fuerte; y (iii) formalizar el contrato entre \texttt{sga-soporte} y \texttt{sga-principal} mediante un DTO de usuario versionado, aun manteniendo la base de datos compartida, para reducir el acoplamiento oculto se\~nalado en el punto~2.
+
+% ============================================================
+% 6. CONCLUSIONES
+% ============================================================
+\section{Conclusiones}
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item El microservicio \texttt{sga-soporte} no implementa replicaci\'on de datos propia; su modelo de consistencia real es el de un \emph{nodo relacional \'unico compartido} entre dos microservicios, diferenciado por esquema, apoyado en las garant\'ias ACID nativas de PostgreSQL.
+  \item Le\'ido bajo CAP, el sistema sacrifica disponibilidad ante una eventual partici\'on hacia el proveedor externo, a cambio de consistencia fuerte autom\'atica; le\'ido bajo PACELC, evita por completo el compromiso latencia--consistencia propio de los sistemas replicados, trasladando el costo a la latencia de red hacia un \'unico proveedor y al l\'imite de concurrencia del pool de conexiones.
+  \item Para el volumen y la criticidad actuales del dominio de tickets de soporte t\'ecnico, el modelo es funcionalmente adecuado, pero no es resultado de una decisi\'on de arquitectura deliberada, sino de la simplicidad de conectar ambos servicios a la misma instancia gestionada.
+  \item Las alternativas evaluadas --- r\'eplicas de lectura as\'incronas y base de datos por servicio con eventos --- mejoran disponibilidad y tolerancia a particiones a costa de consistencia estrictamente fuerte y de mayor complejidad operativa; ninguna es urgente hoy, pero la Alternativa~A deber\'ia priorizarse si el volumen de consultas crece.
+  \item Se recomienda documentar expl\'icitamente esta decisi\'on arquitect\'onica en el proyecto (actualmente impl\'icita en \texttt{application.properties}) y aplicar las tres mitigaciones propuestas en la Secci\'on~5 antes de cualquier despliegue con usuarios reales de la universidad.
+\end{enumerate}
+
+% ============================================================
+% 7. DECLARACION DE USO DE IA GENERATIVA
+% ============================================================
+\section{Declaraci\'on de uso de IA generativa}
+
+Para la elaboraci\'on de este informe se utiliz\'o el asistente de IA generativa \textbf{Claude (Anthropic)} con los siguientes prop\'ositos y alcances:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Inspecci\'on t\'ecnica del c\'odigo fuente} del repositorio \texttt{sga-soporte} (entidades, repositorios, capa de servicio y \texttt{application.properties}) para extraer los hechos de arquitectura descritos en la Secci\'on~3 (topolog\'ia de base de datos, esquemas, transaccionalidad, configuraci\'on del pool de conexiones).
+  \item \textbf{B\'usqueda y verificaci\'on de referencias acad\'emicas} adicionales a las sugeridas en la gu\'ia de la actividad, relacionadas con el patr\'on de base de datos compartida en microservicios (Secci\'on~2.3, referencias \cite{narvaez2025} y \cite{laigner2021}).
+  \item \textbf{Redacci\'on asistida} de las secciones 1 a 6 (introducci\'on, marco te\'orico, an\'alisis, evaluaci\'on de alternativas, discusi\'on cr\'itica y conclusiones), a partir de los hallazgos t\'ecnicos verificados por la estudiante sobre su propio proyecto.
+  \item \textbf{Generaci\'on del diagrama de topolog\'ia} (Figura~\ref{fig:topologia}) en TikZ y de la tabla comparativa (Tabla~\ref{tab:comparacion}) en formato \texttt{booktabs}, a partir de la arquitectura real verificada.
+  \item \textbf{Compilaci\'on y verificaci\'on} del documento \texttt{.tex} con \texttt{pdflatex} para confirmar ausencia de errores de compilaci\'on.
+\end{itemize}
+
+La postura cr\'itica sobre si el modelo es \'optimo (Secci\'on~5), la selecci\'on del dominio propio de an\'alisis y la revisi\'on final del contenido son responsabilidad de la estudiante, quien valid\'o cada afirmaci\'on t\'ecnica contra el c\'odigo fuente real del proyecto antes de la entrega.
+
+% ============================================================
+% REFERENCIAS
+% ============================================================
+\clearpage
+\begin{thebibliography}{99}
+
+\bibitem{abadi2012}
+D. J. Abadi, ``Consistency Tradeoffs in Modern Distributed Database System Design: CAP is Only Part of the Story,'' \emph{Computer}, vol. 45, no. 2, pp. 37--42, 2012. doi: 10.1109/MC.2012.33
+
+\bibitem{corbett2013}
+J. C. Corbett \emph{et al.}, ``Spanner: Google's Globally Distributed Database,'' \emph{ACM Transactions on Computer Systems}, vol. 31, no. 3, pp. 1--22, 2013, art. no. 8. doi: 10.1145/2491245
+
+\bibitem{decandia2007}
+G. DeCandia \emph{et al.}, ``Dynamo: Amazon's Highly Available Key-value Store,'' in \emph{Proc. 21st ACM SIGOPS Symp. Operating Systems Principles (SOSP '07)}, 2007, pp. 205--220. doi: 10.1145/1294261.1294281
+
+\bibitem{gilbert2002}
+S. Gilbert and N. Lynch, ``Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services,'' \emph{ACM SIGACT News}, vol. 33, no. 2, pp. 51--59, 2002. doi: 10.1145/564585.564601
+
+\bibitem{sabaghian2023}
+K. Sabaghian, K. Khamforoosh, and A. Ghaderzadeh, ``Data Replication and Placement Strategies in Distributed Systems: A State of the Art Survey,'' \emph{Wireless Personal Communications}, vol. 129, pp. 2419--2453, 2023. doi: https://doi.org/10.1007/s11277-023-10240-7
+
+\bibitem{viotti2016}
+P. Viotti and M. Vukoli\'c, ``Consistency in Non-Transactional Distributed Storage Systems,'' \emph{ACM Computing Surveys}, vol. 49, no. 1, pp. 1--34, 2016, art. no. 19. doi: 10.1145/2926965
+
+\bibitem{narvaez2025}
+D. Narv\'aez, N. Battaglia, A. Fern\'andez, and G. Rossi, ``Designing Microservices Using AI: A Systematic Literature Review,'' \emph{Software}, vol. 4, no. 1, art. no. 6, 2025. doi: https://doi.org/10.3390/software4010006
+
+\bibitem{laigner2021}
+R. Laigner, Y. Zhou, M. A. Vaz Salles, Y. Liu, and M. Kalinowski, ``Data Management in Microservices: State of the Practice, Challenges, and Research Directions,'' \emph{Proceedings of the VLDB Endowment}, vol. 14, no. 13, pp. 3348--3361, 2021. doi: https://doi.org/10.14778/3484224.3484232
+
+\end{thebibliography}
+
+\end{document}
